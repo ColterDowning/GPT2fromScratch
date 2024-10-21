@@ -52,8 +52,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-
-
 class MLP(nn.Module):
 
     # The inner layer dimensionality of the feed forward is 4x, so we grow our input
@@ -245,12 +243,13 @@ class DataLoaderLite:
         return x, y
 
 #----------------------------------------------------------------------------------------------------
+import time 
 
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
 print(f"using device: {device}")
-print(torch.__version__)
+print(f"PyTorch version: {torch.__version__}")
 print(torch.version.cuda)
 print(torch.cuda.get_device_name(0))
 
@@ -258,22 +257,30 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=256)
+torch.set_float32_matmul_precision('high')
 
 #model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.to(device)
+#model = torch.compile(model) # use if your GPU CUDA compatability >= 7.0 
 
 #optimize! AdamW is a faster way to optimize compared to stochastic gradient descent
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad() # Make sure to always 0 the gradients first!
+    #with torch.autocast(device_type=device, dtype=torch.bfloat16):
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # make sure we wait for the scheduled work to actually finish
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference is in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
