@@ -7,6 +7,7 @@
 from dataclasses import dataclass # For decorators
 import math
 import tiktoken
+import inspect
 import torch # Using PyTorch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -40,12 +41,20 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1,2) # (B, nh, T, hs)
+
         # attention that creates the (T, T) matrix for all queries and keys
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # Masks future tokens so the current token can only learn from previous tokens
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) 
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) 
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # Instead of the 4 lines above computing our attention matrix, let's use flash attention
+        # Flash attention is a clever alogorithm that never materializes the matrix values
+        # on the GPU memory. Going back and forth between memory is the most time-consuming part,
+        # so this saves us a bunch of time
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1,2).contiguous().view(B, T, C) # reassemble the head outputs
         # output projection
         y = self.c_proj(y)
@@ -119,7 +128,7 @@ class GPT(nn.Module): # Sub-class of the nn.Module, meaning GPT gets the methods
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # hidden layers (all blocks in grey in Transformer paper)
             ln_f = nn.LayerNorm(config.n_embd), # Final layer norm added in gpt2
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # Final projection
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # Final projection aka classifier
         # from embedding space to our vocabulary (linear block in Transformer paper)
 
         # weight sharing scheme
@@ -211,6 +220,37 @@ class GPT(nn.Module): # Sub-class of the nn.Module, meaning GPT gets the methods
 
         return model
     
+
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # Remember, we add weight decays to parameters to 'pull' down their weights so the
+        # optimizations use more of the weights and distribute across the tokens more evenly.
+        # We are not allowing any individual weight to be too large.
+
+        # Here we will also use a fused Adam optimizer. This compiles the optimizer before runtime 
+        # so all computations can be done in the GPU tensor cores without being materialized in HBM
+        # memory.
+
+        # start with all candidate parameters that require grad
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise not.
+        # i.e all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params) # numel() returns number of individual weights in parameter p
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == "cuda"
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
 #----------------------------------------------------------------------------------------------------
 
 class DataLoaderLite:
@@ -257,17 +297,44 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=256)
+total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
+B = 4 # micro batch size
+T = 256 # micro sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total  desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 torch.set_float32_matmul_precision('high')
 
 #model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 #model = torch.compile(model) # use if your GPU CUDA compatability >= 7.0 
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it): # cosine decay learning scheduler =)
+    # 1. linear warmup for warmup_iters steps
+    if it < warmup_steps: 
+        return max_lr * (it+1) / warmup_steps
+    # 2. if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+         return min_lr
+    # 3. In between, use the cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
 #optimize! AdamW is a faster way to optimize compared to stochastic gradient descent
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(50):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -275,12 +342,19 @@ for i in range(50):
     #with torch.autocast(device_type=device, dtype=torch.bfloat16):
     logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping the gradient norm to prevent 'shocks' from
+    # unlucky batches. This sets an upper bound at 1.
+    
+    # Determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize() # make sure we wait for the scheduled work to actually finish
     t1 = time.time()
     dt = (t1 - t0)*1000 # time difference is in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
