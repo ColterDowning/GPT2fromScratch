@@ -336,12 +336,18 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad() # Make sure to always 0 the gradients first!
-    #with torch.autocast(device_type=device, dtype=torch.bfloat16):
-    logits, loss = model(x, y)
-    loss.backward()
+    #with torch.autocast(device_type=device, dtype=torch.bfloat16): # If your GPU supports bfloats
+
+    # Since my poor little GPU can't handle a batch size of 0.5M, we can simulate that batch size with
+    # gradient accumulation. This is done by doing forward and backward passes grad_accum_steps
+    # times, and then update the gradient afterwards.
+    for microstep in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # need to normalize over the accumulation
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping the gradient norm to prevent 'shocks' from
     # unlucky batches. This sets an upper bound at 1.
     
