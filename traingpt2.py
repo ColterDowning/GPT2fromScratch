@@ -338,6 +338,7 @@ for step in range(50):
     t0 = time.time()
     optimizer.zero_grad() # Make sure to always 0 the gradients first!
     #with torch.autocast(device_type=device, dtype=torch.bfloat16): # If your GPU supports bfloats
+    loss_accum = 0.0
 
     # Since my poor little GPU can't handle a batch size of 0.5M, we can simulate that batch size with
     # gradient accumulation. This is done by doing forward and backward passes grad_accum_steps
@@ -347,6 +348,7 @@ for step in range(50):
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss = loss / grad_accum_steps # need to normalize over the accumulation
+        loss_accum += loss.detach()
         loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping the gradient norm to prevent 'shocks' from
     # unlucky batches. This sets an upper bound at 1.
@@ -358,9 +360,10 @@ for step in range(50):
     optimizer.step()
     torch.cuda.synchronize() # make sure we wait for the scheduled work to actually finish
     t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference is in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step} | loss: {loss.item()} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
