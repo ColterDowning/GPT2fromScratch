@@ -3,6 +3,7 @@
 # (because the openAI version is written using Tensorflow not PyTorch), and then
 # create our own from-scratch and trained version of the gpt2 model to hopefully
 # surpass the performance of the actual gpt2 model. Let's jump in!
+# Note: I've finished the model architecture but my smol GPU cannot handle the load
 
 from dataclasses import dataclass # For decorators
 import os
@@ -258,6 +259,16 @@ class GPT(nn.Module): # Sub-class of the nn.Module, meaning GPT gets the methods
 #----------------------------------------------------------------------------------------------------
 
 class DataLoaderLite:
+    """
+    Takes an input text document and splits the text into batched token sets x 
+    as input to the LLM.
+    inputs: batch size B
+            Sequence length T
+            ddp rank 
+            num of processes (GPUs)
+            train or val split
+    outputs: concatenated B*T length of tokens for input and targets (x and y)
+    """
     def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
@@ -309,6 +320,8 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Setup DDP (Distributed Data Parallel)
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+# DDP is used for computing over multiple GPUs. This code will still work in the case
+# that you only have 1 GPU. See launch inputs above.
 ddp = int(os.environ.get('RANK', -1)) != -1 # Is this a ddp run?
 if ddp:
     # ddp requires CUDA
@@ -334,6 +347,7 @@ else:
     print(f"CUDA version: {torch.version.cuda}")
     print(f"Device name: {torch.cuda.get_device_name(0)}")
 
+# Set seeds for reproducability
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
@@ -382,7 +396,6 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(max_steps):
     t0 = time.time()
-
     # once in a while evaluate our validation loss
     if step % 5 == 0:
         model.eval()
@@ -407,7 +420,7 @@ for step in range(max_steps):
         num_return_sequences = 1
         max_length = 32
         enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = enc.encode("Good day to you sir")
         tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
@@ -478,5 +491,5 @@ for step in range(max_steps):
 if ddp:
     destroy_process_group()
 
-import sys; sys.exit(0)
+
 
