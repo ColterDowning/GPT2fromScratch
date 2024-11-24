@@ -398,6 +398,7 @@ if use_compile:
     model = torch.compile(model) # use if your GPU CUDA compatability >= 7.0 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -448,6 +449,16 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}") 
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                torch.save(checkpoint, checkpoint_path)
 
     # once in a while, evaluate hellaswag benchmark
     if (step % 250 == 0 or last_step) and (not use_compile):
